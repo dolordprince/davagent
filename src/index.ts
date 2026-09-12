@@ -158,7 +158,16 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
   const result = await env.AI.run(modelId as any, {
     messages: finalMessages,
     max_tokens: maxTokens,
-  } as any) as { response: string };
+  } as any) as any;
+
+  const responseText =
+    typeof result?.response === "string"
+      ? result.response
+      : typeof result?.choices?.[0]?.message?.content === "string"
+        ? result.choices[0].message.content
+        : typeof result?.choices?.[0]?.text === "string"
+          ? result.choices[0].text
+          : "";
 
   return json({
     id: `chatcmpl-${Date.now()}`,
@@ -167,7 +176,7 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
     model: body.model ?? DEFAULT_MODEL,
     choices: [{
       index: 0,
-      message: { role: "assistant", content: result.response },
+      message: { role: "assistant", content: responseText },
       finish_reason: "stop",
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
