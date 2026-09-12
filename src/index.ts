@@ -71,8 +71,14 @@ function extractText(result: any): string {
   if (typeof result?.response === "string" && result.response !== "")
     return result.response;
   const msg = result?.choices?.[0]?.message;
+  // content field (standard)
   if (typeof msg?.content === "string" && msg.content !== "")
     return msg.content;
+  // reasoning field fallback (GLM-4.7 / DeepSeek when content is null)
+  if (typeof msg?.reasoning === "string" && msg.reasoning !== "")
+    return msg.reasoning;
+  if (typeof msg?.reasoning_content === "string" && msg.reasoning_content !== "")
+    return msg.reasoning_content;
   if (typeof result?.choices?.[0]?.text === "string" && result.choices[0].text !== "")
     return result.choices[0].text;
   return JSON.stringify(result ?? "");
@@ -160,7 +166,7 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
   const modelId = resolveModel(body.model);
   const modelAlias: string = body.model ?? DEFAULT_MODEL;
   const stream: boolean = body.stream === true;
-  const maxTokens: number = body.max_tokens ?? 2048;
+  const maxTokens: number = body.max_tokens ?? 4096;
 
   const hasSystem = messages.some((m) => m.role === "system");
   const finalMessages = hasSystem
