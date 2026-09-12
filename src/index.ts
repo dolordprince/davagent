@@ -22,6 +22,7 @@ const MODELS: Record<string, string> = {
   "llama-4-scout":   "@cf/meta/llama-4-scout-17b-16e-instruct",
   "llama-3.3-70b":   "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   "llama-3.1-8b":    "@cf/meta/llama-3.1-8b-instruct",
+  "glm-4.7":         "@cf/zai-org/glm-4.7-flash",
   "mistral-7b":      "@cf/mistralai/mistral-7b-instruct-v0.1",
   "qwen-14b":        "@cf/qwen/qwen1.5-14b-chat-awq",
   "deepseek-r1":     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
