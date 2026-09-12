@@ -8,19 +8,17 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    name: Deploy Worker
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Deploy to Cloudflare Workers
-        run: npx wrangler deploy
+      - name: Install and deploy
+        run: |
+          npm install --legacy-peer-deps
+          npx wrangler deploy
