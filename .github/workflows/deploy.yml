@@ -10,10 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     name: Deploy Worker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        # actions/checkout@v4.2.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        # actions/setup-node@v4.1.0
         with:
           node-version: "20"
 
@@ -24,7 +26,8 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@392e6c9fcfbd78cbff1f4a0802a2c2362a3b84b5
+        # cloudflare/wrangler-action@v3.14.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
