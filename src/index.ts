@@ -13,12 +13,10 @@
 
 export interface Env {
   AI: Ai;
-  AGENT_SECRET?: string; // optional: set in CF dashboard to protect /agent/run
+  AGENT_SECRET?: string;
 }
 
-// ─── Model catalogue ────────────────────────────────────────────────────────
 const MODELS: Record<string, string> = {
-  // aliases → CF Workers AI model IDs
   "llama-4-scout":   "@cf/meta/llama-4-scout-17b-16e-instruct",
   "llama-3.3-70b":   "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
   "llama-3.1-8b":    "@cf/meta/llama-3.1-8b-instruct",
@@ -26,7 +24,6 @@ const MODELS: Record<string, string> = {
   "mistral-7b":      "@cf/mistralai/mistral-7b-instruct-v0.1",
   "qwen-14b":        "@cf/qwen/qwen1.5-14b-chat-awq",
   "deepseek-r1":     "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
-  // default
   "default":         "@cf/meta/llama-4-scout-17b-16e-instruct",
 };
 
@@ -41,7 +38,6 @@ const SYSTEM_PROMPT = `You are DAV AGENT — an expert software engineering assi
 
 When writing code: always complete, always working, no TODOs. When asked for scripts: use heredoc format compatible with bash.`;
 
-// ─── CORS headers ────────────────────────────────────────────────────────────
 function corsHeaders(): HeadersInit {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -61,16 +57,86 @@ function err(message: string, status = 400): Response {
   return json({ error: { message, type: "invalid_request_error" } }, status);
 }
 
-// ─── Resolve model alias → CF model ID ──────────────────────────────────────
 function resolveModel(requested?: string): string {
   if (!requested) return MODELS[DEFAULT_MODEL];
-  // exact CF model ID passed directly
   if (requested.startsWith("@cf/")) return requested;
-  // alias lookup
   return MODELS[requested] ?? MODELS[DEFAULT_MODEL];
 }
 
-// ─── /v1/models ─────────────────────────────────────────────────────────────
+// Normalize CF result → plain string across all model families:
+//   { response: "..." }                              most models
+//   { choices: [{ message: { content: "..." } }] }  GLM-4.7 / OpenAI-compat
+//   { choices: [{ text: "..." }] }                  legacy shape
+function extractText(result: any): string {
+  if (typeof result?.response === "string" && result.response !== "")
+    return result.response;
+  const msg = result?.choices?.[0]?.message;
+  if (typeof msg?.content === "string" && msg.content !== "")
+    return msg.content;
+  if (typeof result?.choices?.[0]?.text === "string" && result.choices[0].text !== "")
+    return result.choices[0].text;
+  return JSON.stringify(result ?? "");
+}
+
+// GLM-4.7 and DeepSeek-R1 emit delta.reasoning before delta.content.
+// Strip reasoning-only chunks so clients receive only the final answer tokens.
+function makeReasoningStripStream(
+  source: ReadableStream,
+  requestId: string,
+  modelAlias: string,
+): ReadableStream {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  (async () => {
+    const reader = source.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (trimmed === "data: [DONE]") {
+            await writer.write(encoder.encode("data: [DONE]\n\n"));
+            continue;
+          }
+          if (!trimmed.startsWith("data:")) continue;
+          let chunk: any;
+          try { chunk = JSON.parse(trimmed.slice(5).trim()); } catch { continue; }
+          const delta = chunk?.choices?.[0]?.delta ?? {};
+          // Skip chunks that only carry reasoning tokens (no content key at all)
+          if (!("content" in delta)) continue;
+          const content: string = typeof delta.content === "string" ? delta.content : "";
+          const out = {
+            id: requestId,
+            object: "chat.completion.chunk",
+            created: chunk.created ?? Math.floor(Date.now() / 1000),
+            model: modelAlias,
+            choices: [{
+              index: 0,
+              delta: { content },
+              finish_reason: chunk?.choices?.[0]?.finish_reason ?? null,
+            }],
+          };
+          await writer.write(encoder.encode(`data: ${JSON.stringify(out)}\n\n`));
+        }
+      }
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+    } finally {
+      writer.close();
+    }
+  })();
+
+  return readable;
+}
+
 function handleModels(): Response {
   const models = Object.keys(MODELS)
     .filter((k) => k !== "default")
@@ -84,38 +150,38 @@ function handleModels(): Response {
   return json({ object: "list", data: models });
 }
 
-// ─── /v1/chat/completions ────────────────────────────────────────────────────
 async function handleChatCompletions(request: Request, env: Env): Promise<Response> {
   let body: any;
-  try {
-    body = await request.json();
-  } catch {
-    return err("Invalid JSON body");
-  }
+  try { body = await request.json(); } catch { return err("Invalid JSON body"); }
 
   const messages = body.messages as { role: string; content: string }[];
   if (!messages?.length) return err("messages array is required");
 
   const modelId = resolveModel(body.model);
+  const modelAlias: string = body.model ?? DEFAULT_MODEL;
   const stream: boolean = body.stream === true;
   const maxTokens: number = body.max_tokens ?? 2048;
-  const temperature: number = body.temperature ?? 0.7;
 
-  // Prepend system prompt if no system message provided
   const hasSystem = messages.some((m) => m.role === "system");
   const finalMessages = hasSystem
     ? messages
     : [{ role: "system", content: SYSTEM_PROMPT }, ...messages];
 
   if (stream) {
-    // Workers AI already returns an OpenAI-compatible SSE stream.
     const aiStream = await env.AI.run(modelId as any, {
       messages: finalMessages,
       stream: true,
       max_tokens: maxTokens,
     } as any);
 
-    return new Response(aiStream as ReadableStream, {
+    const requestId = `chatcmpl-${Date.now()}`;
+    const outStream = makeReasoningStripStream(
+      aiStream as ReadableStream,
+      requestId,
+      modelAlias,
+    );
+
+    return new Response(outStream, {
       headers: {
         ...corsHeaders(),
         "Content-Type": "text/event-stream",
@@ -124,36 +190,25 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
     });
   }
 
-  // Non-streaming
   const result = await env.AI.run(modelId as any, {
     messages: finalMessages,
     max_tokens: maxTokens,
   } as any) as any;
 
-  const responseText =
-    typeof result?.response === "string"
-      ? result.response
-      : typeof result?.choices?.[0]?.message?.content === "string"
-        ? result.choices[0].message.content
-        : typeof result?.choices?.[0]?.text === "string"
-          ? result.choices[0].text
-          : "";
-
   return json({
     id: `chatcmpl-${Date.now()}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: body.model ?? DEFAULT_MODEL,
+    model: modelAlias,
     choices: [{
       index: 0,
-      message: { role: "assistant", content: responseText },
+      message: { role: "assistant", content: extractText(result) },
       finish_reason: "stop",
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
 }
 
-// ─── /v1/completions (legacy) ────────────────────────────────────────────────
 async function handleCompletions(request: Request, env: Env): Promise<Response> {
   let body: any;
   try { body = await request.json(); } catch { return err("Invalid JSON body"); }
@@ -168,26 +223,22 @@ async function handleCompletions(request: Request, env: Env): Promise<Response> 
       { role: "user", content: prompt },
     ],
     max_tokens: body.max_tokens ?? 2048,
-  } as any) as { response: string };
+  } as any) as any;
 
   return json({
     id: `cmpl-${Date.now()}`,
     object: "text_completion",
     created: Math.floor(Date.now() / 1000),
     model: body.model ?? DEFAULT_MODEL,
-    choices: [{ text: result.response, index: 0, finish_reason: "stop" }],
+    choices: [{ text: extractText(result), index: 0, finish_reason: "stop" }],
   });
 }
 
-// ─── /agent/run — OpenHands-style task dispatch ──────────────────────────────
 async function handleAgentRun(request: Request, env: Env): Promise<Response> {
-  // Optional secret check
   if (env.AGENT_SECRET) {
     const auth = request.headers.get("Authorization") ?? "";
     const token = auth.replace("Bearer ", "").trim();
-    if (token !== env.AGENT_SECRET) {
-      return err("Unauthorized", 401);
-    }
+    if (token !== env.AGENT_SECRET) return err("Unauthorized", 401);
   }
 
   let body: any;
@@ -222,18 +273,17 @@ RESULT:
       { role: "user", content: userMsg },
     ],
     max_tokens: body.max_tokens ?? 4096,
-  } as any) as { response: string };
+  } as any) as any;
 
   return json({
     id: `agent-${Date.now()}`,
     task,
     model: body.model ?? DEFAULT_MODEL,
-    response: result.response,
+    response: extractText(result),
     status: "complete",
   });
 }
 
-// ─── Health / root ───────────────────────────────────────────────────────────
 function handleRoot(): Response {
   return json({
     name: "davagent",
@@ -247,21 +297,14 @@ function handleRoot(): Response {
       "POST /v1/completions":      "OpenAI-compatible legacy completions",
       "POST /agent/run":           "OpenHands-style task dispatch",
     },
-    usage: {
-      curl_example: "curl -X POST https://davagent.YOUR_SUBDOMAIN.workers.dev/v1/chat/completions -H 'Content-Type: application/json' -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'",
-      python_example: "from openai import OpenAI; client = OpenAI(base_url='https://davagent.YOUR_SUBDOMAIN.workers.dev/v1', api_key='none'); client.chat.completions.create(model='llama-4-scout', messages=[...])",
-      openhands_example: "LLM(model='openai/llama-4-scout', base_url='https://davagent.YOUR_SUBDOMAIN.workers.dev/v1', api_key='none')",
-    },
   });
 }
 
-// ─── Main fetch handler ──────────────────────────────────────────────────────
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
 
-    // CORS preflight
     if (method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
