@@ -68,17 +68,20 @@ function resolveModel(requested?: string): string {
 //   { choices: [{ message: { content: "..." } }] }  GLM-4.7 / OpenAI-compat
 //   { choices: [{ text: "..." }] }                  legacy shape
 function extractText(result: any): string {
+  // Shape 1: { response: "..." }  — most CF models
   if (typeof result?.response === "string" && result.response !== "")
     return result.response;
+  // Shape 2: { choices: [{ message: { content: "..." } }] }  — GLM-4.7 / OpenAI-compat
+  // content may be null when model ran out of tokens during reasoning phase;
+  // in that case we return "" so caller gets an empty string, not the reasoning chain.
   const msg = result?.choices?.[0]?.message;
-  // content field (standard)
-  if (typeof msg?.content === "string" && msg.content !== "")
-    return msg.content;
-  // reasoning field fallback (GLM-4.7 / DeepSeek when content is null)
-  if (typeof msg?.reasoning === "string" && msg.reasoning !== "")
-    return msg.reasoning;
-  if (typeof msg?.reasoning_content === "string" && msg.reasoning_content !== "")
-    return msg.reasoning_content;
+  if (msg !== undefined && msg !== null) {
+    if (typeof msg.content === "string" && msg.content !== "")
+      return msg.content;
+    // content is null/empty — model hit token limit in reasoning; return empty
+    return "";
+  }
+  // Shape 3: legacy { choices: [{ text: "..." }] }
   if (typeof result?.choices?.[0]?.text === "string" && result.choices[0].text !== "")
     return result.choices[0].text;
   return JSON.stringify(result ?? "");
@@ -166,7 +169,7 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
   const modelId = resolveModel(body.model);
   const modelAlias: string = body.model ?? DEFAULT_MODEL;
   const stream: boolean = body.stream === true;
-  const maxTokens: number = body.max_tokens ?? 4096;
+  const maxTokens: number = Math.max(body.max_tokens ?? 4096, 2048);
 
   const hasSystem = messages.some((m) => m.role === "system");
   const finalMessages = hasSystem
