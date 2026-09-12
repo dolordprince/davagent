@@ -1,0 +1,15 @@
+{
+  "name": "davagent",
+  "version": "1.0.0",
+  "description": "DAV Agent — OpenAI-compatible API on Cloudflare Workers AI",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260911.1",
+    "typescript": "^5.5.2",
+    "wrangler": "^4.0.0"
+  }
+}
