@@ -108,48 +108,18 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
     : [{ role: "system", content: SYSTEM_PROMPT }, ...messages];
 
   if (stream) {
-    // Streaming: SSE response
+    // Workers AI already returns an OpenAI-compatible SSE stream.
     const aiStream = await env.AI.run(modelId as any, {
       messages: finalMessages,
       stream: true,
       max_tokens: maxTokens,
     } as any);
 
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-    const requestId = `chatcmpl-${Date.now()}`;
-
-    // Pipe CF stream → OpenAI SSE format
-    (async () => {
-      const reader = (aiStream as ReadableStream).getReader();
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const text = new TextDecoder().decode(value);
-          // CF streams raw text chunks
-          const chunk = {
-            id: requestId,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: body.model ?? DEFAULT_MODEL,
-            choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-          };
-          await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-        }
-        await writer.write(encoder.encode("data: [DONE]\n\n"));
-      } finally {
-        writer.close();
-      }
-    })();
-
-    return new Response(readable, {
+    return new Response(aiStream as ReadableStream, {
       headers: {
         ...corsHeaders(),
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
-        "Transfer-Encoding": "chunked",
       },
     });
   }
