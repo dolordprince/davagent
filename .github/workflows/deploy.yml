@@ -19,8 +19,8 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install pnpm and deploy
-        run: |
-          npm install -g pnpm
-          pnpm install --no-frozen-lockfile
-          npx wrangler deploy
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Deploy to Cloudflare Workers
+        run: npx wrangler deploy
