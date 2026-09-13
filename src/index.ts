@@ -309,6 +309,86 @@ function handleRoot(): Response {
   });
 }
 
+
+async function handleResponses(request: Request, env: Env): Promise<Response> {
+  let body: any;
+  try { body = await request.json(); } catch { return err("Invalid JSON body"); }
+
+  const modelId = resolveModel(body.model);
+  const modelAlias: string = body.model ?? DEFAULT_MODEL;
+  const stream: boolean = body.stream !== false;
+  const maxTokens: number = body.max_output_tokens ?? body.max_tokens ?? 4096;
+  const requestId = `resp_${Date.now()}`;
+  const itemId = `msg_${Date.now()}`;
+
+  let messages: { role: string; content: string }[] = [];
+  if (typeof body.input === "string") {
+    messages = [{ role: "user", content: body.input }];
+  } else if (Array.isArray(body.input)) {
+    messages = body.input.map((m: any) => ({
+      role: m.role ?? "user",
+      content: typeof m.content === "string" ? m.content
+        : Array.isArray(m.content) ? m.content.map((c: any) => c.text ?? "").join("") : ""
+    }));
+  } else if (Array.isArray(body.messages)) {
+    messages = body.messages;
+  }
+
+  const hasSystem = messages.some(m => m.role === "system");
+  const finalMessages = hasSystem ? messages : [{ role: "system", content: SYSTEM_PROMPT }, ...messages];
+
+  if (stream) {
+    const aiStream = await env.AI.run(modelId as any, {
+      messages: finalMessages, stream: true, max_tokens: maxTokens,
+    } as any);
+
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const enc = new TextEncoder();
+    const send = async (obj: any) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+
+    (async () => {
+      try {
+        await send({ type: "response.created", response: { id: requestId, object: "response", model: modelAlias, status: "in_progress", output: [] }});
+        await send({ type: "response.output_item.added", response_id: requestId, output_index: 0, item: { id: itemId, type: "message", role: "assistant", content: [] }});
+        await send({ type: "response.content_part.added", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "" }});
+
+        const reader = (aiStream as ReadableStream).getReader();
+        const decoder = new TextDecoder();
+        let buf = "", fullText = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n"); buf = lines.pop() ?? "";
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t || t === "data: [DONE]") continue;
+            if (!t.startsWith("data:")) continue;
+            let chunk: any; try { chunk = JSON.parse(t.slice(5).trim()); } catch { continue; }
+            const delta = chunk?.choices?.[0]?.delta ?? {};
+            if (!("content" in delta)) continue;
+            const text = typeof delta.content === "string" ? delta.content : "";
+            if (!text) continue;
+            fullText += text;
+            await send({ type: "response.output_text.delta", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, delta: text });
+          }
+        }
+        await send({ type: "response.output_text.done", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, text: fullText });
+        await send({ type: "response.output_item.done", response_id: requestId, output_index: 0, item: { id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: fullText }] }});
+        await send({ type: "response.completed", response: { id: requestId, object: "response", model: modelAlias, status: "completed", output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: fullText }] }] }});
+        await writer.write(enc.encode("data: [DONE]\n\n"));
+      } finally { writer.close(); }
+    })();
+
+    return new Response(readable, { headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Cache-Control": "no-cache" }});
+  }
+
+  const result = await env.AI.run(modelId as any, { messages: finalMessages, max_tokens: maxTokens } as any) as any;
+  const text = extractText(result);
+  return json({ id: requestId, object: "response", created_at: Math.floor(Date.now()/1000), model: modelAlias, status: "completed", output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text }] }], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }});
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -323,6 +403,7 @@ export default {
     if (method === "GET" && (path === "/" || path === "")) return handleRoot();
     if (method === "GET" && path === "/v1/models") return handleModels();
     if (method === "POST" && path === "/v1/chat/completions") return handleChatCompletions(request, env);
+    if (method === "POST" && path === "/v1/responses") return handleResponses(request, env);
     if (method === "POST" && path === "/v1/completions") return handleCompletions(request, env);
     if (method === "POST" && path === "/agent/run") return handleAgentRun(request, env);
 
