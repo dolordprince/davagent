@@ -385,33 +385,175 @@ async function handleResponses(request: Request, env: Env): Promise<Response> {
   }
 
   // Build tools array if provided (Codex passes tools for shell/file access)
-  const cfPayload: any = { messages: finalMessages, max_tokens: maxTokens };
-  if (body.tools && Array.isArray(body.tools)) {
-    cfPayload.tools = body.tools;
+  /*
+   * Codex sends OpenAI Responses API tool definitions.
+   *
+   * Workers AI traditional function calling expects:
+   *
+   *   {
+   *     name,
+   *     description,
+   *     parameters
+   *   }
+   *
+   * Do not forward Responses API tool objects directly.
+   */
+
+  const responseTools: any[] =
+    Array.isArray(body.tools) ? body.tools : [];
+
+  const workerTools: any[] = [];
+
+  for (const tool of responseTools) {
+    if (!tool || typeof tool !== "object") continue;
+
+    /*
+     * Codex shell tool.
+     *
+     * Normalize it to a Workers AI function called "shell".
+     */
+    if (
+      tool.type === "shell" ||
+      tool.type === "computer_shell" ||
+      tool.type === "function_shell"
+    ) {
+      workerTools.push({
+        name: "shell",
+        description:
+          "Execute shell commands in the agent workspace.",
+        parameters: {
+          type: "object",
+          properties: {
+            commands: {
+              type: "array",
+              items: {
+                type: "string"
+              },
+              description:
+                "Shell commands to execute in the agent workspace."
+            }
+          },
+          required: ["commands"]
+        }
+      });
+
+      continue;
+    }
+
+    /*
+     * Standard OpenAI Responses function.
+     */
+    if (tool.type === "function" && tool.name) {
+      workerTools.push({
+        name: tool.name,
+        description: tool.description || "",
+        parameters:
+          tool.parameters ||
+          tool.input_schema || {
+            type: "object",
+            properties: {}
+          }
+      });
+
+      continue;
+    }
+
+    /*
+     * Already normalized function.
+     */
+    if (tool.name && tool.parameters) {
+      workerTools.push({
+        name: tool.name,
+        description: tool.description || "",
+        parameters: tool.parameters
+      });
+    }
   }
 
-  const result = await env.AI.run(modelId as any, cfPayload as any) as any;
+  const cfPayload: any = {
+    messages: finalMessages,
+    max_tokens: maxTokens
+  };
 
-  // Check if model returned tool_calls
-  const msg = result?.choices?.[0]?.message ?? result;
-  const toolCalls = msg?.tool_calls ?? result?.tool_calls ?? [];
+  if (workerTools.length > 0) {
+    cfPayload.tools = workerTools;
+  }
+
+  /*
+   * Responses tool_choice is not directly compatible with the
+   * Workers AI traditional function-calling schema.
+   */
+  if (body.tool_choice === "none") {
+    delete cfPayload.tools;
+  }
+
+  const result = await env.AI.run(
+    modelId as any,
+    cfPayload as any
+  ) as any;
+
+  const msg =
+    result?.choices?.[0]?.message ??
+    result;
+
+  const toolCalls =
+    Array.isArray(msg?.tool_calls)
+      ? msg.tool_calls
+      : Array.isArray(result?.tool_calls)
+        ? result.tool_calls
+        : [];
 
   if (toolCalls.length > 0) {
-    // Return tool_use output items for Codex to execute
-    const toolUseItems = toolCalls.map((tc: any, i: number) => ({
-      id: `tu_${Date.now()}_${i}`,
-      type: "function_call",
-      call_id: tc.id ?? `call_${i}`,
-      name: tc.function?.name ?? tc.name ?? "shell",
-      arguments: typeof tc.function?.arguments === "string"
-        ? tc.function.arguments
-        : JSON.stringify(tc.function?.arguments ?? tc.arguments ?? {}),
-    }));
+    const output: any[] = [];
+
+    for (let i = 0; i < toolCalls.length; i++) {
+      const tc = toolCalls[i] || {};
+
+      const callId =
+        tc?.id ||
+        `call_${requestId}_${i}`;
+
+      const name =
+        tc?.function?.name ||
+        tc?.name ||
+        "shell";
+
+      let argumentsValue =
+        tc?.function?.arguments ??
+        tc?.arguments ??
+        {};
+
+      if (typeof argumentsValue !== "string") {
+        argumentsValue =
+          JSON.stringify(argumentsValue);
+      }
+
+      /*
+       * OpenAI Responses function-call output item.
+       */
+      output.push({
+        id: `fc_${requestId}_${i}`,
+        type: "function_call",
+        status: "completed",
+        call_id: callId,
+        name,
+        arguments: argumentsValue
+      });
+    }
+
     return json({
-      id: requestId, object: "response", created_at: Math.floor(Date.now()/1000),
-      model: modelAlias, status: "completed",
-      output: toolUseItems,
-      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+      id: requestId,
+      object: "response",
+      created_at:
+        Math.floor(Date.now() / 1000),
+      model: modelAlias,
+      status: "completed",
+      output,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0
+      }
     });
   }
 
