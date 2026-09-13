@@ -384,7 +384,37 @@ async function handleResponses(request: Request, env: Env): Promise<Response> {
     return new Response(readable, { headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Cache-Control": "no-cache" }});
   }
 
-  const result = await env.AI.run(modelId as any, { messages: finalMessages, max_tokens: maxTokens } as any) as any;
+  // Build tools array if provided (Codex passes tools for shell/file access)
+  const cfPayload: any = { messages: finalMessages, max_tokens: maxTokens };
+  if (body.tools && Array.isArray(body.tools)) {
+    cfPayload.tools = body.tools;
+  }
+
+  const result = await env.AI.run(modelId as any, cfPayload as any) as any;
+
+  // Check if model returned tool_calls
+  const msg = result?.choices?.[0]?.message ?? result;
+  const toolCalls = msg?.tool_calls ?? result?.tool_calls ?? [];
+
+  if (toolCalls.length > 0) {
+    // Return tool_use output items for Codex to execute
+    const toolUseItems = toolCalls.map((tc: any, i: number) => ({
+      id: `tu_${Date.now()}_${i}`,
+      type: "function_call",
+      call_id: tc.id ?? `call_${i}`,
+      name: tc.function?.name ?? tc.name ?? "shell",
+      arguments: typeof tc.function?.arguments === "string"
+        ? tc.function.arguments
+        : JSON.stringify(tc.function?.arguments ?? tc.arguments ?? {}),
+    }));
+    return json({
+      id: requestId, object: "response", created_at: Math.floor(Date.now()/1000),
+      model: modelAlias, status: "completed",
+      output: toolUseItems,
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+    });
+  }
+
   const text = extractText(result);
   return json({ id: requestId, object: "response", created_at: Math.floor(Date.now()/1000), model: modelAlias, status: "completed", output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text }] }], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }});
 }
