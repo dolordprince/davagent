@@ -314,48 +314,146 @@ async function handleResponses(request: Request, env: Env): Promise<Response> {
   let body: any;
   try { body = await request.json(); } catch { return err("Invalid JSON body"); }
 
-  const modelId = resolveModel(body.model);
-  const modelAlias: string = body.model ?? DEFAULT_MODEL;
-  const stream: boolean = body.stream !== false;
-  const maxTokens: number = body.max_output_tokens ?? body.max_tokens ?? 4096;
-  const requestId = `resp_${Date.now()}`;
-  const itemId = `msg_${Date.now()}`;
+  const modelId    = resolveModel(body.model);
+  const modelAlias = body.model ?? DEFAULT_MODEL;
+  const maxTokens  = body.max_output_tokens ?? body.max_tokens ?? 4096;
+  const requestId  = `resp_${Date.now()}`;
+  const itemId     = `msg_${Date.now()}`;
 
-  let messages: { role: string; content: string }[] = [];
-  if (typeof body.input === "string") {
-    messages = [{ role: "user", content: body.input }];
-  } else if (Array.isArray(body.input)) {
-    messages = body.input.map((m: any) => ({
-      role: m.role ?? "user",
-      content: typeof m.content === "string" ? m.content
-        : Array.isArray(m.content) ? m.content.map((c: any) => c.text ?? "").join("") : ""
-    }));
-  } else if (Array.isArray(body.messages)) {
-    messages = body.messages;
+  // ── Normalise Responses API input → Workers AI messages ──────────────────
+  const messages: { role: string; content: string }[] = [];
+
+  const inputs: any[] = typeof body.input === "string"
+    ? [{ type: "message", role: "user", content: body.input }]
+    : Array.isArray(body.input) ? body.input
+    : Array.isArray(body.messages) ? body.messages
+    : [];
+
+  for (const item of inputs) {
+    // plain chat message
+    if (item.role && (item.content !== undefined || item.type === "message")) {
+      const role    = item.role === "developer" ? "system" : (item.role ?? "user");
+      const content = typeof item.content === "string" ? item.content
+        : Array.isArray(item.content) ? item.content.map((c: any) => c.text ?? c.output ?? "").join("") : "";
+      messages.push({ role, content });
+      continue;
+    }
+    // function_call_output  (tool result coming back from Codex)
+    if (item.type === "function_call_output") {
+      messages.push({ role: "tool", content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "") });
+      continue;
+    }
+    // function_call  (assistant turn in history)
+    if (item.type === "function_call") {
+      messages.push({ role: "assistant", content: `[tool_call] ${item.name}(${item.arguments ?? ""})` });
+      continue;
+    }
   }
 
-  const hasSystem = messages.some(m => m.role === "system");
-  const finalMessages = hasSystem ? messages : [{ role: "system", content: SYSTEM_PROMPT }, ...messages];
+  if (!messages.some(m => m.role === "system")) {
+    messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+  }
 
-  if (stream) {
+  // ── Build Workers AI payload ──────────────────────────────────────────────
+  const cfPayload: any = { messages, max_tokens: maxTokens };
+
+  if (Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice !== "none") {
+    cfPayload.tools = body.tools.map((t: any) => ({
+      type: "function",
+      function: {
+        name:        t.name ?? t.function?.name,
+        description: t.description ?? t.function?.description ?? "",
+        parameters:  t.parameters ?? t.function?.parameters ?? { type: "object", properties: {} },
+      }
+    }));
+  }
+
+  // ── Run inference (always non-streaming when tools present) ──────────────
+  const result = await env.AI.run(modelId as any, { ...cfPayload, stream: false } as any) as any;
+
+  const msg = result?.choices?.[0]?.message ?? result;
+
+  // Check for tool calls
+  const rawCalls: any[] = Array.isArray(msg?.tool_calls)   ? msg.tool_calls
+    : Array.isArray(result?.tool_calls) ? result.tool_calls : [];
+
+  if (rawCalls.length > 0) {
+    const output = rawCalls.map((tc: any, i: number) => {
+      const fn   = tc.function ?? tc;
+      const args = typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments ?? {});
+      return {
+        type:      "function_call",
+        id:        `fc_${Date.now()}_${i}`,
+        call_id:   tc.id ?? `call_${Date.now()}_${i}`,
+        name:      fn.name ?? tc.name ?? "unknown",
+        arguments: args,
+      };
+    });
+
+    // Codex uses streaming — emit SSE tool-call lifecycle events
+    if (body.stream !== false) {
+      const { readable, writable } = new TransformStream();
+      const writer = writable.getWriter();
+      const enc    = new TextEncoder();
+      const send   = async (obj: any) =>
+        writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+
+      (async () => {
+        try {
+          await send({ type: "response.created", response: { id: requestId, object: "response", model: modelAlias, status: "in_progress", output: [] } });
+
+          for (let i = 0; i < output.length; i++) {
+            const fc = output[i];
+            await send({ type: "response.output_item.added", response_id: requestId, output_index: i, item: { id: fc.id, type: "function_call", call_id: fc.call_id, name: fc.name, arguments: "" } });
+            // Stream arguments character by character (Codex expects delta events)
+            const args = fc.arguments;
+            await send({ type: "response.function_call_arguments.delta", response_id: requestId, item_id: fc.id, output_index: i, delta: args });
+            await send({ type: "response.function_call_arguments.done",  response_id: requestId, item_id: fc.id, output_index: i, arguments: args });
+            await send({ type: "response.output_item.done", response_id: requestId, output_index: i, item: { id: fc.id, type: "function_call", call_id: fc.call_id, name: fc.name, arguments: args } });
+          }
+
+          await send({ type: "response.completed", response: { id: requestId, object: "response", model: modelAlias, status: "completed", output } });
+          await writer.write(enc.encode("data: [DONE]\n\n"));
+        } finally { writer.close(); }
+      })();
+
+      return new Response(readable, { headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
+    }
+
+    return json({
+      id: requestId, object: "response",
+      created_at: Math.floor(Date.now() / 1000),
+      model: modelAlias, status: "completed",
+      output,
+      usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    });
+  }
+
+  // Plain text response
+  const text = extractText(result);
+
+  // Streaming path — used when Codex requests stream:true without tools
+  if (body.stream === true) {
     const aiStream = await env.AI.run(modelId as any, {
-      messages: finalMessages, stream: true, max_tokens: maxTokens,
+      messages, stream: true, max_tokens: maxTokens,
     } as any);
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
-    const enc = new TextEncoder();
-    const send = async (obj: any) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+    const enc    = new TextEncoder();
+    const send   = async (obj: any) =>
+      writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
 
     (async () => {
       try {
-        await send({ type: "response.created", response: { id: requestId, object: "response", model: modelAlias, status: "in_progress", output: [] }});
-        await send({ type: "response.output_item.added", response_id: requestId, output_index: 0, item: { id: itemId, type: "message", role: "assistant", content: [] }});
-        await send({ type: "response.content_part.added", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "" }});
+        await send({ type: "response.created", response: { id: requestId, object: "response", model: modelAlias, status: "in_progress", output: [] } });
+        await send({ type: "response.output_item.added", response_id: requestId, output_index: 0, item: { id: itemId, type: "message", role: "assistant", content: [] } });
+        await send({ type: "response.content_part.added", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, part: { type: "output_text", text: "" } });
 
-        const reader = (aiStream as ReadableStream).getReader();
+        const reader  = (aiStream as ReadableStream).getReader();
         const decoder = new TextDecoder();
         let buf = "", fullText = "";
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -368,198 +466,32 @@ async function handleResponses(request: Request, env: Env): Promise<Response> {
             let chunk: any; try { chunk = JSON.parse(t.slice(5).trim()); } catch { continue; }
             const delta = chunk?.choices?.[0]?.delta ?? {};
             if (!("content" in delta)) continue;
-            const text = typeof delta.content === "string" ? delta.content : "";
-            if (!text) continue;
-            fullText += text;
-            await send({ type: "response.output_text.delta", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, delta: text });
+            const tok = typeof delta.content === "string" ? delta.content : "";
+            if (!tok) continue;
+            fullText += tok;
+            await send({ type: "response.output_text.delta", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, delta: tok });
           }
         }
-        await send({ type: "response.output_text.done", response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, text: fullText });
-        await send({ type: "response.output_item.done", response_id: requestId, output_index: 0, item: { id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: fullText }] }});
-        await send({ type: "response.completed", response: { id: requestId, object: "response", model: modelAlias, status: "completed", output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: fullText }] }] }});
+
+        await send({ type: "response.output_text.done",  response_id: requestId, item_id: itemId, output_index: 0, content_index: 0, text: fullText });
+        await send({ type: "response.output_item.done",  response_id: requestId, output_index: 0, item: { id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: fullText }] } });
+        await send({ type: "response.completed", response: { id: requestId, object: "response", model: modelAlias, status: "completed", output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text: fullText }] }] } });
         await writer.write(enc.encode("data: [DONE]\n\n"));
       } finally { writer.close(); }
     })();
 
-    return new Response(readable, { headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Cache-Control": "no-cache" }});
+    return new Response(readable, { headers: { ...corsHeaders(), "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
   }
 
-  // Build tools array if provided (Codex passes tools for shell/file access)
-  /*
-   * Codex sends OpenAI Responses API tool definitions.
-   *
-   * Workers AI traditional function calling expects:
-   *
-   *   {
-   *     name,
-   *     description,
-   *     parameters
-   *   }
-   *
-   * Do not forward Responses API tool objects directly.
-   */
-
-  const responseTools: any[] =
-    Array.isArray(body.tools) ? body.tools : [];
-
-  const workerTools: any[] = [];
-
-  for (const tool of responseTools) {
-    if (!tool || typeof tool !== "object") continue;
-
-    /*
-     * Codex shell tool.
-     *
-     * Normalize it to a Workers AI function called "shell".
-     */
-    if (
-      tool.type === "shell" ||
-      tool.type === "computer_shell" ||
-      tool.type === "function_shell"
-    ) {
-      workerTools.push({
-        name: "shell",
-        description:
-          "Execute shell commands in the agent workspace.",
-        parameters: {
-          type: "object",
-          properties: {
-            commands: {
-              type: "array",
-              items: {
-                type: "string"
-              },
-              description:
-                "Shell commands to execute in the agent workspace."
-            }
-          },
-          required: ["commands"]
-        }
-      });
-
-      continue;
-    }
-
-    /*
-     * Standard OpenAI Responses function.
-     */
-    if (tool.type === "function" && tool.name) {
-      workerTools.push({
-        name: tool.name,
-        description: tool.description || "",
-        parameters:
-          tool.parameters ||
-          tool.input_schema || {
-            type: "object",
-            properties: {}
-          }
-      });
-
-      continue;
-    }
-
-    /*
-     * Already normalized function.
-     */
-    if (tool.name && tool.parameters) {
-      workerTools.push({
-        name: tool.name,
-        description: tool.description || "",
-        parameters: tool.parameters
-      });
-    }
-  }
-
-  const cfPayload: any = {
-    messages: finalMessages,
-    max_tokens: maxTokens
-  };
-
-  if (workerTools.length > 0) {
-    cfPayload.tools = workerTools;
-  }
-
-  /*
-   * Responses tool_choice is not directly compatible with the
-   * Workers AI traditional function-calling schema.
-   */
-  if (body.tool_choice === "none") {
-    delete cfPayload.tools;
-  }
-
-  const result = await env.AI.run(
-    modelId as any,
-    cfPayload as any
-  ) as any;
-
-  const msg =
-    result?.choices?.[0]?.message ??
-    result;
-
-  const toolCalls =
-    Array.isArray(msg?.tool_calls)
-      ? msg.tool_calls
-      : Array.isArray(result?.tool_calls)
-        ? result.tool_calls
-        : [];
-
-  if (toolCalls.length > 0) {
-    const output: any[] = [];
-
-    for (let i = 0; i < toolCalls.length; i++) {
-      const tc = toolCalls[i] || {};
-
-      const callId =
-        tc?.id ||
-        `call_${requestId}_${i}`;
-
-      const name =
-        tc?.function?.name ||
-        tc?.name ||
-        "shell";
-
-      let argumentsValue =
-        tc?.function?.arguments ??
-        tc?.arguments ??
-        {};
-
-      if (typeof argumentsValue !== "string") {
-        argumentsValue =
-          JSON.stringify(argumentsValue);
-      }
-
-      /*
-       * OpenAI Responses function-call output item.
-       */
-      output.push({
-        id: `fc_${requestId}_${i}`,
-        type: "function_call",
-        status: "completed",
-        call_id: callId,
-        name,
-        arguments: argumentsValue
-      });
-    }
-
-    return json({
-      id: requestId,
-      object: "response",
-      created_at:
-        Math.floor(Date.now() / 1000),
-      model: modelAlias,
-      status: "completed",
-      output,
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        total_tokens: 0
-      }
-    });
-  }
-
-  const text = extractText(result);
-  return json({ id: requestId, object: "response", created_at: Math.floor(Date.now()/1000), model: modelAlias, status: "completed", output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text }] }], usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }});
+  return json({
+    id: requestId, object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    model: modelAlias, status: "completed",
+    output: [{ id: itemId, type: "message", role: "assistant", content: [{ type: "output_text", text }] }],
+    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+  });
 }
+
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
