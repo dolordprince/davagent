@@ -330,22 +330,28 @@ async function handleResponses(request: Request, env: Env): Promise<Response> {
     : [];
 
   for (const item of inputs) {
-    // plain chat message
-    if (item.role && (item.content !== undefined || item.type === "message")) {
-      const role    = item.role === "developer" ? "system" : (item.role ?? "user");
-      const content = typeof item.content === "string" ? item.content
-        : Array.isArray(item.content) ? item.content.map((c: any) => c.text ?? c.output ?? "").join("") : "";
-      messages.push({ role, content });
-      continue;
-    }
-    // function_call_output  (tool result coming back from Codex)
+    // function_call_output (tool result from Codex after executing shell/file tool)
     if (item.type === "function_call_output") {
-      messages.push({ role: "tool", content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "") });
+      const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
+      messages.push({ role: "tool", content: `Tool result for ${item.call_id ?? "tool"}: ${output}` });
       continue;
     }
-    // function_call  (assistant turn in history)
+    // function_call in history (assistant wanted to call a tool)
     if (item.type === "function_call") {
-      messages.push({ role: "assistant", content: `[tool_call] ${item.name}(${item.arguments ?? ""})` });
+      const args = typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {});
+      messages.push({ role: "assistant", content: `I will call ${item.name} with: ${args}` });
+      continue;
+    }
+    // plain message or developer/system
+    if (item.role || item.type === "message") {
+      const role = item.role === "developer" ? "system" : (item.role ?? "user");
+      let content = "";
+      if (typeof item.content === "string") {
+        content = item.content;
+      } else if (Array.isArray(item.content)) {
+        content = item.content.map((c: any) => c.text ?? c.output ?? "").join("");
+      }
+      if (content || role === "user") messages.push({ role, content });
       continue;
     }
   }
